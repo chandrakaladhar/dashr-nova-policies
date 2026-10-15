@@ -1,0 +1,79 @@
+name: ci
+
+# Pull requests: lint and test.
+# main:          also publish the bundle as :main and :sha-<commit> (local clusters follow :main).
+# v* tags:       also publish as :<version> (production pins this in cluster-vars.yaml).
+on:
+  push:
+    branches: [main]
+    tags: ["v*"]
+    paths-ignore: ["**.md"]   # not applied to tag pushes
+  pull_request:
+
+env:
+  OPA_VERSION: 1.4.2          # keep in step with the OPA server image in dashr-platform-gitops
+  BUNDLE_REPO: ghcr.io/${{ github.repository }}
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: open-policy-agent/setup-opa@v2
+        with:
+          version: ${{ env.OPA_VERSION }}
+
+      - name: Format
+        run: opa fmt --list --fail policy
+
+      - name: Check
+        run: opa check --strict policy
+
+      - name: Test
+        run: |
+          opa test policy --verbose
+          opa test policy --coverage --threshold 100 > /dev/null
+
+  publish:
+    if: github.event_name == 'push'
+    needs: test
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: open-policy-agent/setup-opa@v2
+        with:
+          version: ${{ env.OPA_VERSION }}
+
+      - uses: oras-project/setup-oras@v1
+
+      - name: Tags
+        id: tags
+        run: |
+          if [[ "$GITHUB_REF" == refs/tags/v* ]]; then
+            echo "revision=${GITHUB_REF_NAME#v}" >> "$GITHUB_OUTPUT"
+            echo "tags=${GITHUB_REF_NAME#v}" >> "$GITHUB_OUTPUT"
+          else
+            sha="$(git rev-parse --short HEAD)"
+            echo "revision=main-$sha" >> "$GITHUB_OUTPUT"
+            echo "tags=main,sha-$sha" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Build bundle
+        run: |
+          # The revision is reported by OPA at /v1/status and in decision logs.
+          opa build --bundle policy --ignore '*_test.rego' \
+            --revision "${{ steps.tags.outputs.revision }}" --output bundle.tar.gz
+          tar -tzf bundle.tar.gz
+
+      - name: Push bundle
+        run: |
+          echo '{}' > config.json
+          echo "${{ secrets.GITHUB_TOKEN }}" | oras login ghcr.io -u "${{ github.actor }}" --password-stdin
+          oras push "$BUNDLE_REPO:${{ steps.tags.outputs.tags }}" \
+            --config config.json:application/vnd.oci.image.config.v1+json \
+            bundle.tar.gz:application/vnd.oci.image.layer.v1.tar+gzip
